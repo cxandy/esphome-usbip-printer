@@ -1,0 +1,97 @@
+esphome:
+  name: usbip-mfc7420
+  friendly_name: "Brother MFC-7420 USB-IP"
+  platformio_options:
+    build_flags:
+      # Must match the sdkconfig values below
+      - -DCONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+      - -DCONFIG_USB_HOST_HW_BUFFER_BIAS_BALANCED=1
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # USB Host configuration (required by the usbip component)
+      CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE: "1024"
+      CONFIG_USB_HOST_HW_BUFFER_BIAS_BALANCED: y
+      CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK: y
+      # The DWC2 DMA engine needs internal SRAM; the N16R8 has 8MB PSRAM.
+      CONFIG_SPIRAM: n
+
+logger:
+  # Mandatory for this component: GPIO19/20 are used by USB Host.
+  # Logs are available through the web server / API instead.
+  baud_rate: 0
+  level: DEBUG
+  logs:
+    usbip: DEBUG
+
+wifi:
+  # 2.4 GHz only. Replace these two values before flashing.
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+  power_save_mode: none
+  ap:
+    ssid: "usbip-mfc7420"
+    password: "usbip1234"
+
+captive_portal:
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+external_components:
+  - source:
+      type: local
+      path: ./components
+    components: [usbip]
+
+web_server:
+  port: 80
+  version: 3
+  local: true
+
+usbip:
+  # Standard USB/IP port. Do NOT add printer_firmware for the MFC-7420.
+  port: 3240
+  # JetDirect-style RAW print server (TCP 9100). A Windows "Standard TCP/IP
+  # Port" printer pointing here can push jobs straight to the USB printer,
+  # so no USB/IP client is needed on the printing machine.
+  raw_print_port: 9100
+  # Print a card with the device name, IP address and ports on the attached
+  # printer itself. This is how a user without Home Assistant finds the
+  # device: the address is on paper.
+  print_info_card: true
+  # Advertise the print server via mDNS ("_usbip._tcp") with the current IP
+  # address in the TXT record.
+  mdns_discovery: true
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+    icon: mdi:clock-outline
+    entity_category: diagnostic
+  - platform: internal_temperature
+    name: "Internal Temperature"
+    entity_category: diagnostic
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      entity_category: diagnostic
+
+switch:
+  - platform: restart
+    name: "Restart Device"
+    entity_category: diagnostic

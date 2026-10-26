@@ -1,8 +1,15 @@
 #include "usbip_component.h"
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/application.h"
+#ifdef USE_NETWORK
+#include "esphome/components/network/util.h"
+#include "esphome/components/network/ip_address.h"
+#endif
 
 #include <cstring>
+#include <string>
+#include <span>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -10,6 +17,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+
+#ifdef USE_MDNS
+#include <mdns.h>
+#endif
 
 // ESP-IDF USB Host includes
 #include "usb/usb_host.h"
@@ -724,6 +735,11 @@ void USBIPComponent::setup() {
 
   // Start TCP server
   this->start_server_();
+
+  // Optional RAW print server (JetDirect-style)
+  if (this->raw_port_ != 0) {
+    this->start_raw_print_server_();
+  }
 }
 
 void USBIPComponent::usb_host_init_() {
@@ -846,6 +862,454 @@ void USBIPComponent::start_server_() {
   ESP_LOGI(TAG, "USB/IP server listening on port %d", this->port_);
 }
 
+// ============================================================================
+// RAW print server (JetDirect-style, TCP 9100)
+//
+// Lets a plain TCP client push a print job straight to the attached USB
+// printer. This is what a Windows "Standard TCP/IP Port" printer speaks, so
+// no USB/IP client is needed on the printing machine at all.
+// ============================================================================
+
+void USBIPComponent::start_raw_print_server_() {
+  this->raw_server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+  if (this->raw_server_fd_ < 0) {
+    ESP_LOGE(TAG, "RAW print server: failed to create socket: %d", errno);
+    return;
+  }
+
+  int opt = 1;
+  setsockopt(this->raw_server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+  int flags = fcntl(this->raw_server_fd_, F_GETFL, 0);
+  fcntl(this->raw_server_fd_, F_SETFL, flags | O_NONBLOCK);
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_port = htons(this->raw_port_);
+
+  if (bind(this->raw_server_fd_, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    ESP_LOGE(TAG, "RAW print server: failed to bind port %d: %d", this->raw_port_, errno);
+    close(this->raw_server_fd_);
+    this->raw_server_fd_ = -1;
+    return;
+  }
+
+  if (listen(this->raw_server_fd_, 1) < 0) {
+    ESP_LOGE(TAG, "RAW print server: failed to listen: %d", errno);
+    close(this->raw_server_fd_);
+    this->raw_server_fd_ = -1;
+    return;
+  }
+
+  ESP_LOGI(TAG, "RAW print server listening on port %d", this->raw_port_);
+}
+
+void USBIPComponent::handle_raw_client_() {
+  if (this->raw_server_fd_ < 0) {
+    return;
+  }
+
+  if (this->raw_client_fd_ < 0) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    int new_client = accept(this->raw_server_fd_, (struct sockaddr *)&client_addr, &client_len);
+    if (new_client < 0) {
+      return;
+    }
+
+    if (!this->usb_device_.enumerated || this->usb_device_.printer_bulk_out_ep == 0) {
+      ESP_LOGW(TAG, "RAW print client rejected: no printer ready");
+      close(new_client);
+      return;
+    }
+    if (this->client_fd_ >= 0) {
+      ESP_LOGW(TAG, "RAW print client rejected: a USB/IP client is already attached");
+      close(new_client);
+      return;
+    }
+
+    ESP_LOGI(TAG, "RAW print client connected");
+    this->raw_client_fd_ = new_client;
+    this->raw_bytes_total_ = 0;
+
+    int opt = 1;
+    setsockopt(this->raw_client_fd_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    int flags = fcntl(this->raw_client_fd_, F_GETFL, 0);
+    fcntl(this->raw_client_fd_, F_SETFL, flags | O_NONBLOCK);
+    return;
+  }
+
+  // Read whatever the client sent and forward it to the printer.
+  uint8_t buf[512];
+  ssize_t n = recv(this->raw_client_fd_, buf, sizeof(buf), 0);
+  if (n == 0) {
+    ESP_LOGI(TAG, "RAW print job done: %u bytes forwarded to the printer", (unsigned) this->raw_bytes_total_);
+    close(this->raw_client_fd_);
+    this->raw_client_fd_ = -1;
+    return;
+  }
+  if (n < 0) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      ESP_LOGW(TAG, "RAW print recv error: %d", errno);
+      close(this->raw_client_fd_);
+      this->raw_client_fd_ = -1;
+    }
+    return;
+  }
+
+  this->raw_bytes_total_ += (uint32_t) n;
+  ESP_LOGI(TAG, "RAW print: forwarding %d bytes to the printer (total %u)", (int) n, (unsigned) this->raw_bytes_total_);
+  if (!this->send_printer_bulk_out_(buf, (size_t) n)) {
+    ESP_LOGE(TAG, "RAW print: forwarding to the printer failed");
+  }
+}
+
+bool USBIPComponent::send_printer_bulk_out_(const uint8_t *data, size_t length) {
+  if (!usb_device_hdl || this->usb_device_.printer_bulk_out_ep == 0) {
+    ESP_LOGE(TAG, "Printer bulk OUT endpoint not available");
+    return false;
+  }
+
+  usb_transfer_t *transfer = nullptr;
+  esp_err_t err = usb_host_transfer_alloc(BULK_MPS, 0, &transfer);
+  if (err != ESP_OK || !transfer) {
+    ESP_LOGE(TAG, "Failed to allocate bulk transfer: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  transfer->device_handle = usb_device_hdl;
+  transfer->bEndpointAddress = this->usb_device_.printer_bulk_out_ep;
+  transfer->callback = usb_transfer_callback;
+  transfer->timeout_ms = 5000;
+
+  size_t offset = 0;
+  bool ok = true;
+  while (offset < length) {
+    size_t chunk = length - offset;
+    if (chunk > BULK_MPS) {
+      chunk = BULK_MPS;
+    }
+
+    memcpy(transfer->data_buffer, data + offset, chunk);
+    transfer->num_bytes = chunk;
+
+    prepare_transfer(transfer);
+    err = usb_host_transfer_submit(transfer);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "bulk OUT submit failed at %u: %s", (unsigned) offset, esp_err_to_name(err));
+      ok = false;
+      break;
+    }
+
+    // Pump the USB host events while the transfer completes.
+    uint32_t chunk_start = millis();
+    while (!transfer_completed && (millis() - chunk_start) < 5000) {
+      uint32_t event_flags;
+      usb_host_lib_handle_events(0, &event_flags);
+      if (usb_client_hdl) {
+        usb_host_client_handle_events(usb_client_hdl, 0);
+      }
+    }
+
+    if (!transfer_completed) {
+      ESP_LOGE(TAG, "bulk OUT timeout at %u", (unsigned) offset);
+      ok = false;
+      break;
+    }
+    if (transfer_status != USB_TRANSFER_STATUS_COMPLETED) {
+      ESP_LOGE(TAG, "bulk OUT error at %u: status=%d", (unsigned) offset, transfer_status);
+      ok = false;
+      break;
+    }
+
+    offset += chunk;
+  }
+
+  usb_host_transfer_free(transfer);
+  return ok;
+}
+
+void USBIPComponent::find_printer_endpoints_() {  this->usb_device_.printer_bulk_out_ep = 0;
+  this->usb_device_.printer_bulk_in_ep = 0;
+
+  const std::vector<uint8_t> &cfg = this->usb_device_.config_descriptor;
+  if (cfg.size() < 9) {
+    return;
+  }
+
+  size_t total_length = (size_t) cfg[2] | ((size_t) cfg[3] << 8);
+  if (total_length > cfg.size()) {
+    total_length = cfg.size();
+  }
+
+  size_t offset = cfg[0];
+  uint8_t current_class = 0xFF;
+  while (offset + 2 <= total_length) {
+    uint8_t desc_len = cfg[offset];
+    uint8_t desc_type = cfg[offset + 1];
+    if (desc_len < 2) {
+      break;
+    }
+
+    if (desc_type == USB_DESC_INTERFACE && desc_len >= 9) {
+      current_class = cfg[offset + 5];  // bInterfaceClass
+    } else if (desc_type == USB_DESC_ENDPOINT && desc_len >= 7 && current_class == USB_PRINTER_CLASS) {
+      uint8_t addr = cfg[offset + 2];
+      uint8_t attr = cfg[offset + 3];
+      if ((attr & 0x03) == 0x02) {  // bulk transfer type
+        if (addr & 0x80) {
+          if (this->usb_device_.printer_bulk_in_ep == 0) {
+            this->usb_device_.printer_bulk_in_ep = addr;
+          }
+        } else {
+          if (this->usb_device_.printer_bulk_out_ep == 0) {
+            this->usb_device_.printer_bulk_out_ep = addr;
+          }
+        }
+      }
+    }
+
+    offset += desc_len;
+  }
+
+  ESP_LOGI(TAG, "Printer endpoints: bulk OUT=0x%02X bulk IN=0x%02X",
+           this->usb_device_.printer_bulk_out_ep, this->usb_device_.printer_bulk_in_ep);
+}
+
+// ============================================================================
+// Info card
+//
+// The device prints its own network address on the attached printer. This is
+// how a user without Home Assistant (or any app) finds out where the device
+// is: the information is on paper, produced by the printer itself.
+//
+// The card is plain PCL 5e ASCII text so it prints on any laser printer
+// without relying on a specific code page (no non-ASCII glyphs are used).
+// ============================================================================
+
+std::string USBIPComponent::use_address_() {
+#ifdef USE_NETWORK
+  char buf[network::USE_ADDRESS_BUFFER_SIZE];
+  const char *addr = network::get_use_address_to(std::span<char, network::USE_ADDRESS_BUFFER_SIZE>(buf));
+  if (addr != nullptr && addr[0] != '\0') {
+    return addr;
+  }
+#endif
+  return std::string(App.get_name()) + ".local";
+}
+
+bool USBIPComponent::current_ip_(std::string &ip) {
+#ifdef USE_NETWORK
+  ip.clear();
+  for (const auto &addr : network::get_ip_addresses()) {
+    if (!addr.is_set() || !addr.is_ip4()) {
+      continue;
+    }
+    char buf[network::IP_ADDRESS_BUFFER_SIZE];
+    ip = addr.str_to(buf);
+    break;
+  }
+  return !ip.empty();
+#else
+  (void) ip;
+  return false;
+#endif
+}
+
+bool USBIPComponent::build_info_card_(std::string &out) {
+  std::string ip;
+  if (!this->current_ip_(ip)) {
+    ESP_LOGW(TAG, "Info card: no IP address yet");
+    return false;
+  }
+
+  const std::string name = App.get_name();
+  const std::string host = this->use_address_();
+
+  out.clear();
+  // A4 portrait, 11pt Helvetica
+  out += "\x1b&l26A\x1b&l1O\x1b(s11H";
+
+  int y = 120;
+  auto line = [&](const std::string &text) {
+    char pos[32];
+    snprintf(pos, sizeof(pos), "\x1b*p60X\x1b*p%dY", y);
+    out += pos;
+    out += text;
+    y += 60;  // 6 mm line spacing
+  };
+
+  line("USB/IP PRINT SERVER");
+  line("--------------------------------");
+  line("Device : " + name);
+  line("Host   : " + host);
+
+  // The IP address is the one thing the user has to type, so print it big.
+  {
+    char pos[32];
+    snprintf(pos, sizeof(pos), "\x1b*p60X\x1b*p%dY\x1b(s22H", y);
+    out += pos;
+    out += ip;
+    y += 110;
+    out += "\x1b(s11H";
+  }
+
+  line("Web UI  : http://" + ip + "/");
+  if (this->raw_port_ != 0) {
+    line("Print   : TCP " + std::to_string(this->raw_port_) + "  (raw, JetDirect)");
+  }
+  line("USB/IP  : TCP " + std::to_string(this->port_));
+  line("--------------------------------");
+  line("To print from a computer, add a network printer");
+  line("using the IP address above:");
+  line("  Windows: Add printer > TCP/IP > <IP>");
+  line("  macOS  : Add printer > IP > <IP>");
+  line("  Linux  : use the Web UI above to find the");
+  line("           attached USB printer's address.");
+  out += "\x0c";  // form feed
+
+  ESP_LOGI(TAG, "Info card for %s (%s)", name.c_str(), ip.c_str());
+  return true;
+}
+
+void USBIPComponent::print_info_card_() {
+  std::string card;
+  if (!this->build_info_card_(card)) {
+    return;
+  }
+
+  ESP_LOGI(TAG, "Printing info card (%u bytes)", (unsigned) card.size());
+  if (!this->send_printer_bulk_out_(reinterpret_cast<const uint8_t *>(card.data()), card.size())) {
+    ESP_LOGE(TAG, "Failed to print the info card");
+    return;
+  }
+  this->info_card_printed_ = true;
+}
+
+// ============================================================================
+// mDNS discovery
+//
+// The device advertises itself as "_usbip._tcp" including its current IP
+// address in the TXT record. A user without Home Assistant can browse mDNS
+// (e.g. with any mDNS browser app, or `dns-sd -B _usbip._tcp`) to find the
+// print server and its address, instead of guessing an IP address.
+//
+// The service is registered from the main loop, i.e. after the ESPHome mDNS
+// component has called mdns_init(), and the TXT record is refreshed whenever
+// the IP address changes (for example after a DHCP renewal).
+// ============================================================================
+
+static constexpr const char *MDNS_SERVICE_TYPE = "_usbip";
+static constexpr const char *MDNS_SERVICE_PROTO = "_tcp";
+
+// Delay before the service is advertised for the first time (the mDNS
+// responder needs a moment after the network came up), retry delay after a
+// failed registration and the interval of the "is the record still there?"
+// check that re-advertises the service if it vanished.
+static constexpr uint32_t MDNS_INITIAL_DELAY_MS = 5000;
+static constexpr uint32_t MDNS_RETRY_DELAY_MS = 2000;
+static constexpr uint32_t MDNS_CHECK_INTERVAL_MS = 15000;
+
+void USBIPComponent::build_mdns_txt_(std::vector<std::pair<std::string, std::string>> &records, const std::string &ip) {
+  records.clear();
+  records.emplace_back("txtvers", "1");
+  records.emplace_back("type", "usbip-print-server");
+  records.emplace_back("ip", ip);
+  records.emplace_back("host", this->use_address_());
+  records.emplace_back("usbip", std::to_string(this->port_));
+  if (this->raw_port_ != 0) {
+    records.emplace_back("raw", std::to_string(this->raw_port_));
+  }
+#ifdef USE_WEBSERVER_PORT
+  records.emplace_back("web", std::to_string(USE_WEBSERVER_PORT));
+#endif
+  if (this->usb_device_.enumerated) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%04x", this->usb_device_.vid);
+    records.emplace_back("vid", buf);
+    snprintf(buf, sizeof(buf), "%04x", this->usb_device_.pid);
+    records.emplace_back("pid", buf);
+  }
+}
+
+void USBIPComponent::update_mdns_() {
+#ifdef USE_MDNS
+  if (!this->mdns_discovery_ || !network::is_connected()) {
+    return;
+  }
+
+  std::string ip;
+  if (!this->current_ip_(ip)) {
+    return;
+  }
+
+  std::vector<std::pair<std::string, std::string>> records;
+  this->build_mdns_txt_(records, ip);
+
+  std::vector<mdns_txt_item_t> txt;
+  txt.reserve(records.size());
+  for (const auto &record : records) {
+    txt.push_back({record.first.c_str(), record.second.c_str()});
+  }
+
+  const uint32_t now = millis();
+
+  if (!this->mdns_registered_) {
+    // Give the mDNS responder a moment to settle after the network came up,
+    // then (re-)register the service.
+    if (this->mdns_retry_at_ == 0) {
+      this->mdns_retry_at_ = now + MDNS_INITIAL_DELAY_MS;
+      return;
+    }
+    if (static_cast<int32_t>(now - this->mdns_retry_at_) < 0) {
+      return;
+    }
+    this->mdns_retry_at_ = 0;
+
+    esp_err_t err = mdns_service_add(nullptr, MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, this->port_, txt.data(),
+                                     (uint8_t) txt.size());
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "mDNS: could not advertise %s%s: %s", MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, esp_err_to_name(err));
+      // Try again a bit later.
+      this->mdns_retry_at_ = now + MDNS_RETRY_DELAY_MS;
+      return;
+    }
+    this->mdns_registered_ = true;
+    this->mdns_ip_ = ip;
+    this->mdns_last_check_ = now;
+    ESP_LOGI(TAG, "mDNS: advertising %s%s on %s (ip %s)", MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO,
+             this->use_address_().c_str(), ip.c_str());
+    return;
+  }
+
+  // The service can disappear again - for example after a restart that tore
+  // the mDNS server down. Check now and then and re-register if needed.
+  if (static_cast<int32_t>(now - this->mdns_last_check_) >= MDNS_CHECK_INTERVAL_MS) {
+    this->mdns_last_check_ = now;
+    if (!mdns_service_exists(MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, nullptr)) {
+      ESP_LOGW(TAG, "mDNS: %s%s is gone, advertising it again", MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO);
+      this->mdns_registered_ = false;
+      this->mdns_retry_at_ = now + MDNS_RETRY_DELAY_MS;
+      return;
+    }
+  }
+
+  if (ip != this->mdns_ip_) {
+    // The address changed - refresh the TXT record so browsers see the new IP.
+    esp_err_t err = mdns_service_txt_set(MDNS_SERVICE_TYPE, MDNS_SERVICE_PROTO, txt.data(), (uint8_t) txt.size());
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "mDNS: could not update TXT record: %s", esp_err_to_name(err));
+      return;
+    }
+    this->mdns_ip_ = ip;
+    ESP_LOGI(TAG, "mDNS: address changed to %s, TXT record updated", ip.c_str());
+  }
+#endif
+}
+
 void USBIPComponent::loop() {
   // Handle device discovery request from daemon task
   // IMPORTANT: usb_host_device_open() must be called from main loop, not daemon task
@@ -910,6 +1374,35 @@ void USBIPComponent::loop() {
       this->handle_client_();
     }
   }
+
+  // RAW print server (JetDirect-style)
+  if (this->raw_server_fd_ >= 0) {
+    this->handle_raw_client_();
+  }
+
+  // Info card: print it once the printer is ready and the network is up, so
+  // the card can show a real IP address. Only one card per boot, so a printer
+  // that is re-plugged does not waste a page.
+  if (this->info_card_pending_ && !this->info_card_printed_ && this->usb_device_.printer_bulk_out_ep != 0) {
+    bool network_up = true;
+#ifdef USE_NETWORK
+    network_up = network::is_connected();
+#endif
+    if (network_up) {
+      if (this->info_card_deadline_ == 0) {
+        // Give the printer and the network a moment to settle
+        this->info_card_deadline_ = millis() + 3000;
+      } else if (static_cast<int32_t>(millis() - this->info_card_deadline_) >= 0) {
+        this->info_card_pending_ = false;
+        this->info_card_deadline_ = 0;
+        this->print_info_card_();
+      }
+    }
+  }
+
+  // mDNS discovery: advertise the print server and keep the IP in the TXT
+  // record up to date.
+  this->update_mdns_();
 }
 
 void USBIPComponent::usb_host_task_() {
@@ -974,6 +1467,15 @@ void USBIPComponent::on_device_connected(uint8_t dev_addr) {
 
   // Initialize printer device if it's a printer class
   this->init_printer_device_();
+
+  // Locate the printer interface's bulk endpoints (used by the RAW print server)
+  this->find_printer_endpoints_();
+
+  // Schedule the info card; it is printed once the network is up as well
+  if (this->info_card_enabled_) {
+    this->info_card_pending_ = true;
+    this->info_card_deadline_ = 0;
+  }
 }
 
 void USBIPComponent::on_device_disconnected(uint8_t dev_addr) {
@@ -987,7 +1489,7 @@ void USBIPComponent::on_device_disconnected(uint8_t dev_addr) {
 
   if (usb_device_hdl) {
     // Release all claimed interfaces
-    for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < 4; i++) {
+    for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < USBIP_MAX_INTERFACES; i++) {
       uint8_t iface_num = this->usb_device_.interfaces[i].interface_number;
       usb_host_interface_release(usb_client_hdl, usb_device_hdl, iface_num);
     }
@@ -1009,6 +1511,8 @@ void USBIPComponent::on_device_disconnected(uint8_t dev_addr) {
   this->usb_device_.config_descriptor.clear();
   this->usb_device_.num_interfaces = 0;
   this->usb_device_.num_endpoints = 0;
+  this->usb_device_.printer_bulk_out_ep = 0;
+  this->usb_device_.printer_bulk_in_ep = 0;
 
 #ifdef HAS_PRINTER_FIRMWARE
   // During firmware upload flow, don't reset fw_state_ or disconnect client
@@ -1110,11 +1614,11 @@ bool USBIPComponent::enumerate_device_(uint8_t dev_addr) {
       reinterpret_cast<const uint8_t *>(config_desc),
       reinterpret_cast<const uint8_t *>(config_desc) + total_length);
 
-  this->usb_device_.num_interfaces = config_desc->bNumInterfaces;
+  const uint8_t declared_interfaces = config_desc->bNumInterfaces;
   this->usb_device_.current_configuration = config_desc->bConfigurationValue;
 
   ESP_LOGD(TAG, "Config: %d interfaces, %d bytes",
-           this->usb_device_.num_interfaces, total_length);
+           declared_interfaces, total_length);
 
   esp_task_wdt_reset();
 
@@ -1124,7 +1628,8 @@ bool USBIPComponent::enumerate_device_(uint8_t dev_addr) {
   uint8_t interface_idx = 0;
   uint8_t endpoint_idx = 0;
 
-  while (offset < total_length && interface_idx < 4 && endpoint_idx < 16) {
+  while (offset < total_length && interface_idx < USBIP_MAX_INTERFACES &&
+         endpoint_idx < USBIP_MAX_ENDPOINTS) {
     uint8_t desc_len = desc_ptr[offset];
     uint8_t desc_type = desc_ptr[offset + 1];
 
@@ -1162,6 +1667,18 @@ bool USBIPComponent::enumerate_device_(uint8_t dev_addr) {
   }
 
   this->usb_device_.num_endpoints = endpoint_idx;
+
+  // The DEVLIST reply declares bNumInterfaces and is then followed by exactly
+  // that many interface records. Use the number of interfaces we actually
+  // parsed and stored, so the declared count and the number of records sent
+  // can never disagree. A device offering more interfaces than we can track
+  // is reported with the interfaces we know about instead of desyncing the
+  // client's read loop.
+  this->usb_device_.num_interfaces = interface_idx;
+  if (declared_interfaces != interface_idx) {
+    ESP_LOGW(TAG, "Device declares %d interfaces, tracked %d - reporting the tracked count",
+             declared_interfaces, interface_idx);
+  }
 
   // Determine device speed (convert ESP-IDF speed to Linux USB/IP speed values)
   usb_device_info_t dev_info;
@@ -1248,7 +1765,7 @@ bool USBIPComponent::enumerate_device_(uint8_t dev_addr) {
   // Even if the library doesn't track the active config, claiming might still work
   ESP_LOGD(TAG, "Claiming %d interfaces...", interface_idx);
   bool any_claimed = false;
-  for (uint8_t i = 0; i < interface_idx && i < 4; i++) {
+  for (uint8_t i = 0; i < interface_idx && i < USBIP_MAX_INTERFACES; i++) {
     uint8_t iface_num = this->usb_device_.interfaces[i].interface_number;
     err = usb_host_interface_claim(usb_client_hdl, usb_device_hdl, iface_num, 0);
     if (err == ESP_OK) {
@@ -1269,7 +1786,7 @@ bool USBIPComponent::enumerate_device_(uint8_t dev_addr) {
 
 #ifdef HAS_PRINTER_FIRMWARE
 bool USBIPComponent::has_mass_storage_interface_() const {
-  for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < 4; i++) {
+  for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < USBIP_MAX_INTERFACES; i++) {
     if (this->usb_device_.interfaces[i].interface_class == USB_CLASS_MASS_STORAGE) {
       return true;
     }
@@ -1278,7 +1795,7 @@ bool USBIPComponent::has_mass_storage_interface_() const {
 }
 
 bool USBIPComponent::has_printer_interface_() const {
-  for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < 4; i++) {
+  for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < USBIP_MAX_INTERFACES; i++) {
     if (this->usb_device_.interfaces[i].interface_class == USB_PRINTER_CLASS) {
       return true;
     }
@@ -1290,7 +1807,7 @@ bool USBIPComponent::handle_hp_smart_install_() {
   // Find bulk OUT and bulk IN endpoints on the mass storage interface
   uint8_t bulk_out_ep = 0;
   uint8_t bulk_in_ep = 0;
-  for (uint8_t i = 0; i < this->usb_device_.num_endpoints && i < 16; i++) {
+  for (uint8_t i = 0; i < this->usb_device_.num_endpoints && i < USBIP_MAX_ENDPOINTS; i++) {
     uint8_t addr = this->usb_device_.endpoints[i].address;
     uint8_t attr = this->usb_device_.endpoints[i].attributes;
     if ((attr & 0x03) == 0x02) {  // Bulk transfer type
@@ -1401,7 +1918,7 @@ bool USBIPComponent::upload_hp_firmware_() {
 
   // Find bulk OUT endpoint on printer interface
   uint8_t bulk_out_ep = 0;
-  for (uint8_t i = 0; i < this->usb_device_.num_endpoints && i < 16; i++) {
+  for (uint8_t i = 0; i < this->usb_device_.num_endpoints && i < USBIP_MAX_ENDPOINTS; i++) {
     uint8_t addr = this->usb_device_.endpoints[i].address;
     uint8_t attr = this->usb_device_.endpoints[i].attributes;
     if ((attr & 0x03) == 0x02 && !(addr & 0x80)) {  // Bulk OUT
@@ -1520,7 +2037,7 @@ void USBIPComponent::init_printer_device_() {
 
   // Find printer interface (class 0x07)
   int printer_interface = -1;
-  for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < 4; i++) {
+  for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < USBIP_MAX_INTERFACES; i++) {
     if (this->usb_device_.interfaces[i].interface_class == USB_PRINTER_CLASS) {
       printer_interface = this->usb_device_.interfaces[i].interface_number;
       ESP_LOGD(TAG, "Found printer interface %d (subclass=%d, protocol=%d)",
@@ -1626,7 +2143,7 @@ void USBIPComponent::init_printer_device_() {
   // Step 4: Release and re-claim interfaces to reset ESP-IDF's internal
   // data toggle tracking (ensures host-side toggles start at DATA0)
   ESP_LOGD(TAG, "Re-claiming interfaces to reset toggle state");
-  for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < 4; i++) {
+  for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < USBIP_MAX_INTERFACES; i++) {
     uint8_t iface_num = this->usb_device_.interfaces[i].interface_number;
     err = usb_host_interface_release(usb_client_hdl, usb_device_hdl, iface_num);
     if (err == ESP_OK) {
@@ -1647,6 +2164,9 @@ void USBIPComponent::init_printer_device_() {
 void USBIPComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "USB/IP Component:");
   ESP_LOGCONFIG(TAG, "  Port: %d", this->port_);
+  if (this->raw_port_ != 0) {
+    ESP_LOGCONFIG(TAG, "  RAW print port: %d", this->raw_port_);
+  }
 #ifdef HAS_PRINTER_FIRMWARE
   ESP_LOGCONFIG(TAG, "  Printer firmware: %u bytes", (unsigned)printer_fw_data_size);
 #endif
@@ -1775,7 +2295,7 @@ void USBIPComponent::send_devlist_response_() {
     }
 
     // Send interface info for each interface
-    for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < 4; i++) {
+    for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < USBIP_MAX_INTERFACES; i++) {
       USBIPInterfaceInfo iface_info;
       iface_info.bInterfaceClass = this->usb_device_.interfaces[i].interface_class;
       iface_info.bInterfaceSubClass = this->usb_device_.interfaces[i].interface_subclass;
@@ -2101,7 +2621,7 @@ bool USBIPComponent::handle_control_transfer_(uint32_t seqnum, const uint8_t *se
             vTaskDelay(pdMS_TO_TICKS(50));
 
             // Re-claim all interfaces
-            for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < 4; i++) {
+            for (uint8_t i = 0; i < this->usb_device_.num_interfaces && i < USBIP_MAX_INTERFACES; i++) {
               uint8_t iface_num = this->usb_device_.interfaces[i].interface_number;
               // First try to release (ignore errors)
               usb_host_interface_release(usb_client_hdl, usb_device_hdl, iface_num);

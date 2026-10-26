@@ -4,10 +4,13 @@ from esphome.const import CONF_ID, CONF_PORT
 from pathlib import Path
 
 CODEOWNERS = ["@custom"]
-DEPENDENCIES = []
+DEPENDENCIES = ["network"]
 AUTO_LOAD = []
 
 CONF_PRINTER_FIRMWARE = "printer_firmware"
+CONF_RAW_PRINT_PORT = "raw_print_port"
+CONF_PRINT_INFO_CARD = "print_info_card"
+CONF_MDNS_DISCOVERY = "mdns_discovery"
 
 usbip_ns = cg.esphome_ns.namespace("usbip")
 USBIPComponent = usbip_ns.class_("USBIPComponent", cg.Component)
@@ -17,6 +20,15 @@ CONFIG_SCHEMA = cv.Schema(
         cv.GenerateID(): cv.declare_id(USBIPComponent),
         cv.Optional(CONF_PORT, default=3240): cv.port,
         cv.Optional(CONF_PRINTER_FIRMWARE): cv.file_,
+        # JetDirect-style RAW print server. When set, a plain TCP client can
+        # push a print job straight to the attached USB printer (port 9100).
+        cv.Optional(CONF_RAW_PRINT_PORT, default=0): cv.port,
+        # Print a card with the device's own IP address on the attached
+        # printer, so users without Home Assistant can find it.
+        cv.Optional(CONF_PRINT_INFO_CARD, default=False): cv.boolean,
+        # Advertise the print server via mDNS ("_usbip._tcp"), including the
+        # current IP address, so it can be discovered on the local network.
+        cv.Optional(CONF_MDNS_DISCOVERY, default=True): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -26,6 +38,9 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     cg.add(var.set_port(config[CONF_PORT]))
+    cg.add(var.set_raw_print_port(config[CONF_RAW_PRINT_PORT]))
+    cg.add(var.set_print_info_card(config[CONF_PRINT_INFO_CARD]))
+    cg.add(var.set_mdns_discovery(config[CONF_MDNS_DISCOVERY]))
 
     # Add ESP-IDF USB Host component
     cg.add_build_flag("-DCONFIG_USB_OTG_SUPPORTED=1")

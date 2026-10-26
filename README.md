@@ -19,6 +19,9 @@ Implemented with help of AI. This is a POC and works for my HP LaserJet P1102w p
 - USB device hot-plug detection (connect and disconnect at runtime)
 - Automatic HP Smart Install firmware upload for HP LaserJet P1102w printer
 - Workaround for ESP32-S3 DWC2 bulk OUT DMA silicon bug
+- JetDirect-style RAW print server (TCP 9100) so Windows/macOS/Linux can print without any USB/IP client
+- mDNS discovery (`_usbip._tcp`) that carries the current IP address in the TXT record
+- Info card: the device prints its own IP address on the attached printer, so even a user without Home Assistant can find it
 
 ## Prerequisites
 
@@ -62,6 +65,93 @@ sudo usbip detach -p 0
 
 Once attached, the device appears as a native USB device. Use it with CUPS, `lp`, or any standard driver.
 
+### 3b. Attach from Windows (no USB/IP client needed)
+
+Windows has no built-in USB/IP client, and the classic `usbip-win` client needs an
+unsigned driver (test-signing mode). The component can therefore also act as a
+plain **JetDirect-style RAW print server** on TCP 9100, which is what a Windows
+*Standard TCP/IP Port* printer speaks:
+
+```yaml
+usbip:
+  port: 3240
+  raw_print_port: 9100
+```
+
+On the Windows machine: *Settings → Printers & scanners → Add printer → Add a
+printer using a TCP/IP address or host name* → host `192.168.18.103` → pick the
+printer's own driver (the MFC-7420 speaks PCL5e, so any PCL laser driver works).
+
+The raw stream is forwarded to the printer's bulk OUT endpoint, split into
+64-byte max-packet-size chunks to work around the DWC2 bulk OUT DMA freeze.
+
+### 3c. Finding the device without Home Assistant
+
+A user who has no Home Assistant still has to learn the device's IP address. The
+component offers three independent ways to do that, and none of them requires
+guessing an address.
+
+**1. The printer prints it — `print_info_card: true`**
+
+Once the USB printer is enumerated and the network is up, the device sends a
+small card to the printer over USB containing the device name, the IP address,
+the `.local` host name, the web UI URL, and the TCP ports:
+
+```
+USB/IP PRINT SERVER
+--------------------------------
+Device : usbip-mfc7420
+Host   : usbip-mfc7420.local
+
+192.168.18.103          <- printed in 22pt
+
+Web UI  : http://192.168.18.103/
+Print   : TCP 9100  (raw, JetDirect)
+USB/IP  : TCP 3240
+--------------------------------
+To print from a computer, add a network printer
+using the IP address above:
+  Windows: Add printer > TCP/IP > <IP>
+  macOS  : Add printer > IP > <IP>
+  Linux  : use the Web UI above to find the
+           attached USB printer's address.
+```
+
+The card is plain PCL 5e ASCII text (no code page or font dependency) and is
+printed once per boot, so re-plugging the printer does not waste a page.
+
+**2. mDNS — `mdns_discovery: true`**
+
+The device advertises itself as `_usbip._tcp` and puts its current IP address
+into the TXT record:
+
+```console
+$ dns-sd -B _usbip._tcp          # macOS / Linux (Bonjour)
+$ avahi-browse -rt _usbip._tcp   # Linux
+```
+
+| TXT key | Value |
+|----------|-------|
+| `ip` | current IPv4 address of the device |
+| `host` | `<name>.local` host name |
+| `usbip` | USB/IP port (3240) |
+| `raw` | RAW print port (9100), if enabled |
+| `web` | web server port |
+| `vid` / `pid` | USB vendor / product ID of the attached printer |
+
+The record is refreshed automatically when the address changes (e.g. after a
+DHCP renewal).
+
+**3. Fallback access point**
+
+The example configuration also starts a fallback AP (`usbip-mfc7420`) with a
+captive portal. If the device cannot reach the configured WiFi network, the
+user joins that AP and the captive portal page shows the current status.
+
+**Tip for production:** give the device a fixed address. A DHCP reservation in
+the router is the simplest option; `static_ip:` in the ESPHome config is the
+alternative. Then the printed address never changes.
+
 ## Configuration
 
 ### Component parameters
@@ -70,12 +160,18 @@ Once attached, the device appears as a native USB device. Use it with CUPS, `lp`
 usbip:
   port: 3240                        # optional, default 3240
   printer_firmware: sihpP1102.dl    # optional, HP P1102w only
+  raw_print_port: 9100              # optional, default 0 (off)
+  print_info_card: true             # optional, default false
+  mdns_discovery: true              # optional, default true
 ```
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `port` | No | `3240` | TCP port for the USB/IP server. 3240 is the standard Linux USB/IP port. |
 | `printer_firmware` | No | — | Path to an HP printer firmware blob (relative to config file). When set, the firmware is embedded into flash at compile time and automatically uploaded whenever the printer is plugged in. |
+| `raw_print_port` | No | `0` (off) | Enables a JetDirect-style RAW print server (TCP 9100). A plain TCP client — e.g. a Windows *Standard TCP/IP Port* printer — can push a print job straight to the attached USB printer without any USB/IP client on the printing machine. |
+| `print_info_card` | No | `false` | Prints a card with the device name, IP address and ports on the attached printer once it is enumerated and the network is up. Lets a user without Home Assistant find the device. |
+| `mdns_discovery` | No | `true` | Advertises the print server as `_usbip._tcp` via mDNS, with the current IP address in the TXT record. Requires the ESPHome `mdns` component (loaded automatically with `network`). |
 
 ### Required ESP-IDF sdkconfig options
 
@@ -181,6 +277,9 @@ USB transfers in ESP-IDF are asynchronous. The component uses a sequence-numbere
 - Isochronous and interrupt transfers are not implemented (bulk and control only)
 - Full-Speed devices only (12 Mbit/s) — the ESP32-S3 USB host does not support High-Speed
 - PSRAM must be disabled due to DMA constraints
+- The ESP-IDF 5.5 mDNS responder can stop answering *multicast* queries a while
+  after boot (the service record itself stays intact and still answers unicast
+  queries). The IP card and the web UI are not affected by this.
 
 ## Troubleshooting
 

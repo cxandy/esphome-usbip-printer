@@ -2,8 +2,10 @@
 
 #include "esphome/core/component.h"
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <functional>
+#include <utility>
 
 // No forward declarations needed - using BSD sockets
 
@@ -130,6 +132,14 @@ struct EndpointInfo {
   uint8_t interval{0};
 };
 
+// Caps on the interface/endpoint data tracked for an attached device.
+// The DEVLIST reply declares bNumInterfaces and then sends exactly that many
+// interface records, so the storage cap, the declared count and the number of
+// records sent must always agree - otherwise a client that counts records
+// while reading desyncs and the attach fails.
+static constexpr uint8_t USBIP_MAX_INTERFACES = 10;
+static constexpr uint8_t USBIP_MAX_ENDPOINTS = 16;
+
 // Stored USB device information
 struct USBDevice {
   bool connected{false};
@@ -147,12 +157,16 @@ struct USBDevice {
   uint8_t num_interfaces{0};
   USBIPSpeed speed{USBIP_SPEED_FULL};
 
-  // Interface info (up to 4 interfaces)
-  InterfaceInfo interfaces[4];
+  // Interface info (up to USBIP_MAX_INTERFACES interfaces)
+  InterfaceInfo interfaces[USBIP_MAX_INTERFACES];
 
-  // Endpoint info (up to 16 endpoints)
-  EndpointInfo endpoints[16];
+  // Endpoint info (up to USBIP_MAX_ENDPOINTS endpoints)
+  EndpointInfo endpoints[USBIP_MAX_ENDPOINTS];
   uint8_t num_endpoints{0};
+
+  // Bulk endpoints of the printer interface, used by the RAW print server
+  uint8_t printer_bulk_out_ep{0};
+  uint8_t printer_bulk_in_ep{0};
 
   // Device descriptors (cached)
   std::vector<uint8_t> device_descriptor;
@@ -170,6 +184,21 @@ class USBIPComponent : public Component {
   float get_setup_priority() const override;
 
   void set_port(uint16_t port) { this->port_ = port; }
+
+  // Enable the JetDirect-style RAW print server (TCP 9100). 0 disables it.
+  // Lets a plain TCP client (e.g. a Windows "Standard TCP/IP Port" printer)
+  // push a print job straight to the attached USB printer.
+  void set_raw_print_port(uint16_t port) { this->raw_port_ = port; }
+
+  // Print a small info card (device name, IP address, ports) on the attached
+  // printer once it is enumerated. Lets a user who has no Home Assistant
+  // discover the device without ever typing an IP address.
+  void set_print_info_card(bool enabled) { this->info_card_enabled_ = enabled; }
+
+  // Advertise the print server via mDNS ("_usbip._tcp"), including the
+  // current IP address in the TXT record. Lets a user without Home Assistant
+  // find the device from any mDNS browser.
+  void set_mdns_discovery(bool enabled) { this->mdns_discovery_ = enabled; }
 
   // USB Host callbacks
   void on_device_connected(uint8_t dev_addr);
@@ -197,6 +226,22 @@ class USBIPComponent : public Component {
   bool enumerate_device_(uint8_t dev_addr);
   void init_printer_device_();
 
+  // RAW print server (JetDirect-style, TCP 9100)
+  void start_raw_print_server_();
+  void handle_raw_client_();
+  bool send_printer_bulk_out_(const uint8_t *data, size_t length);
+  void find_printer_endpoints_();
+
+  // Info card printing
+  void print_info_card_();
+  bool build_info_card_(std::string &out);
+
+  // mDNS discovery
+  void update_mdns_();
+  void build_mdns_txt_(std::vector<std::pair<std::string, std::string>> &records, const std::string &ip);
+  bool current_ip_(std::string &ip);
+  std::string use_address_();
+
 #ifdef HAS_PRINTER_FIRMWARE
   // HP Smart Install firmware upload
   bool handle_hp_smart_install_();
@@ -222,6 +267,25 @@ class USBIPComponent : public Component {
 
   // Configuration
   uint16_t port_{3240};
+
+  // RAW print server state
+  uint16_t raw_port_{0};
+  int raw_server_fd_{-1};
+  int raw_client_fd_{-1};
+  uint32_t raw_bytes_total_{0};
+
+  // Info card state
+  bool info_card_enabled_{false};
+  bool info_card_pending_{false};
+  bool info_card_printed_{false};
+  uint32_t info_card_deadline_{0};
+
+  // mDNS discovery state
+  bool mdns_discovery_{true};
+  bool mdns_registered_{false};
+  std::string mdns_ip_;
+  uint32_t mdns_retry_at_{0};
+  uint32_t mdns_last_check_{0};
 
   // Server state (using BSD sockets)
   int server_fd_{-1};

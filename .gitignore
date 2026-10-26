@@ -1,0 +1,19 @@
+# Local, device-specific configuration.
+#
+# This file contains the WiFi credentials of the actual device, so it is kept
+# out of the repository. Use `usbip_mfc7420.example.yaml` as a starting point
+# and copy it here:
+#
+#     copy usbip_mfc7420.example.yaml usbip_mfc7420.yaml
+#
+usbip_mfc7420.yaml
+
+# Python cache
+__pycache__/
+*.pyc
+
+# ESPHome build artifacts
+/.esphome/
+
+# Local secrets
+/secrets.yaml
