@@ -20,3 +20,6 @@ __pycache__/
 
 # GUI runtime settings (per machine)
 usbip-gui.ini
+
+# CI build diagnostics
+compile.log

@@ -65,10 +65,10 @@ jobs:
         run: |
           & "$env:windir\Microsoft.NET\Framework64\v4.0.30319\csc.exe" `
             /nologo /target:winexe /platform:anycpu /langversion:5 `
-            /win32manifest:tools/usbip-client/src/app.manifest `
+            /win32manifest:tools\usbip-client\src\app.manifest `
             /codepage:65001 `
-            /out:tools/usbip-win-0.3.6-dev/USBIP-Client.exe `
-            tools/usbip-client/src/usbip-client.cs 2>&1 | Tee-Object -FilePath compile.log
+            /out:tools\usbip-win-0.3.6-dev\USBIP-Client.exe `
+            tools\usbip-client\src\usbip-client.cs 2>&1 | Tee-Object -FilePath compile.log
           exit $LASTEXITCODE
 
       - name: Commit exe and build log back to the repo
@@ -80,7 +80,7 @@ jobs:
           if (Test-Path tools/usbip-win-0.3.6-dev/USBIP-Client.exe) {
             git add tools/usbip-win-0.3.6-dev/USBIP-Client.exe
           }
-          if (Test-Path compile.log) { git add compile.log }
+          if (Test-Path compile.log) { git add -f compile.log }
           $staged = @(git diff --cached --name-only)
           if ($staged.Count -gt 0) {
             git commit -m "ci: update USBIP-Client.exe build output [skip ci]"
