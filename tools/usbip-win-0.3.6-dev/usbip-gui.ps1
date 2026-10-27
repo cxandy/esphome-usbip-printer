@@ -24,6 +24,8 @@ if (Test-Path $ini) {
         elseif ($_ -match '^\s*interval\s*=\s*(\d+)\s*$')  { $cfg.interval = [int]$Matches[1] }
     }
 }
+# sanity check: discard a saved value that is not a valid IPv4 address
+if ($cfg.ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { $cfg.ip = '' }
 function Save-Cfg {
     Set-Content -Path $ini -Encoding ASCII -Value @(
         "ip=$($cfg.ip)",
@@ -121,7 +123,8 @@ function Find-Servers {
         }
         foreach ($t in $pending) { try { $t.Client.Close() } catch { } }
     } catch { }
-    return $found | Select-Object -Unique
+    # leading comma preserves the array even for a single result
+    return ,@($found | Select-Object -Unique)
 }
 
 # ---------- form ----------
@@ -226,7 +229,7 @@ $btnConnect.Add_Click({
     # IP empty or stale -> discover automatically
     if (-not $cfg.ip) {
         Log '未填写 IP，开始自动扫描...'
-        $found = Find-Servers
+        $found = @(Find-Servers)
         if (-not $found) {
             Log '[错误] 自动扫描未发现设备。请确认打印机已插好、ESP32 已联网。'
             return
@@ -238,11 +241,9 @@ $btnConnect.Add_Click({
     Save-Cfg
 
     $r = Run-Usbip 'install'
-    if ($r.Exit -eq 0) { Log 'vhci 驱动已就绪' }
-    else {
-        $msg = $r.Err.Trim(); if (-not $msg) { $msg = $r.Out.Trim() }
-        Log "驱动安装输出: $msg"
-    }
+    $installMsg = ($r.Out + ' ' + $r.Err).Trim()
+    if ($r.Exit -eq 0 -or $installMsg -match 'already exist') { Log 'vhci 驱动已就绪' }
+    else { Log "驱动安装输出: $installMsg" }
 
     if (-not $cfg.busid) {
         Log "正在探测 $($cfg.ip) 上的设备..."
@@ -287,8 +288,8 @@ $btnDetach.Add_Click({
 $btnScan.Add_Click({
     $cfg.ip = $txtIp.Text.Trim()
     Log "开始扫描 USB/IP 打印服务器..."
-    $found = Find-Servers
-    if (-not $found) {
+    $found = @(Find-Servers)
+    if ($found.Count -eq 0) {
         Log '[失败] 未发现设备。请确认打印机已插好、ESP32 已接入同一网段。'
         return
     }
@@ -297,7 +298,7 @@ $btnScan.Add_Click({
     $cfg.ip = $found[0]
     $txtIp.Text = $cfg.ip
     Save-Cfg
-    Log "[OK] 已选用 $cfg.ip"
+    Log "[OK] 已选用 $($cfg.ip)"
 })
 
 $btnRefresh.Add_Click({
@@ -351,7 +352,7 @@ $timer.Add_Tick({
         # several failures in a row usually mean the IP changed (DHCP) -> re-scan
         if ($script:failCount -eq 4 -and -not $script:lastAttachOk) {
             Log '[提示] 连续失败，IP 可能已变化，重新扫描...'
-            $found = Find-Servers
+            $found = @(Find-Servers)
             if ($found) {
                 foreach ($f in $found) { Log "  发现设备: $f" }
                 $cfg.ip = $found[0]
