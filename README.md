@@ -11,15 +11,20 @@ A USB/IP server that runs on a Waveshare ESP32-S3-ETH board as an [ESPHome](http
 
 The Linux host sees the USB device as if it were directly attached. All USB operations (control transfers, bulk IN/OUT, descriptors) are forwarded transparently.
 
-Implemented with help of AI. This is a POC and works for my HP LaserJet P1102w printer.
+Implemented with help of AI. This is a POC. Verified with:
+
+- **HP LaserJet P1102w** (Linux client + automatic Smart Install firmware upload)
+- **Canon LBP-2900** (CAPT / host-based printer) via the **Windows usbip-win client** — see [3b](#3b-attach-from-windows-with-usbip-win-required-for-capt-host-based-printers)
+- **Brother MFC-7420** via the RAW print server (it speaks PCL5e) and via USB/IP
 
 ## Features
 
-- Standard USB/IP v1.1.1 protocol — works with the `usbip` tools shipped with the Linux kernel
+- Standard USB/IP v1.1.1 protocol — works with the `usbip` tools shipped with the Linux kernel **and** the `usbip-win` client on Windows
+- Windows client binaries bundled in [`tools/usbip-win-0.3.6-dev/`](tools/usbip-win-0.3.6-dev/) (attestation-signed vhci driver, no test-signing mode needed)
 - USB device hot-plug detection (connect and disconnect at runtime)
 - Automatic HP Smart Install firmware upload for HP LaserJet P1102w printer
 - Workaround for ESP32-S3 DWC2 bulk OUT DMA silicon bug
-- JetDirect-style RAW print server (TCP 9100) so Windows/macOS/Linux can print without any USB/IP client
+- JetDirect-style RAW print server (TCP 9100) so Windows/macOS/Linux can print without any USB/IP client (printers speaking a standard language such as PCL/PS only — CAPT/host-based printers need the USB/IP client)
 - mDNS discovery (`_usbip._tcp`) that carries the current IP address in the TXT record
 - Info card: the device prints its own IP address on the attached printer, so even a user without Home Assistant can find it
 
@@ -28,6 +33,7 @@ Implemented with help of AI. This is a POC and works for my HP LaserJet P1102w p
 - **Hardware:** [Waveshare ESP32-S3-ETH](https://www.waveshare.com/wiki/ESP32-S3-ETH) (or any ESP32-S3 board with Ethernet and exposed USB host pins)
 - **Framework:** [ESPHome](https://esphome.io/) 2025.12+ with ESP-IDF backend
 - **Linux client:** `usbip` utilities (package `linux-tools-common` on Ubuntu/Debian)
+- **Windows client:** [usbip-win](https://github.com/cezanne/usbip-win) — a copy is bundled in [`tools/usbip-win-0.3.6-dev/`](tools/usbip-win-0.3.6-dev/)
 
 ## Getting Started
 
@@ -65,12 +71,56 @@ sudo usbip detach -p 0
 
 Once attached, the device appears as a native USB device. Use it with CUPS, `lp`, or any standard driver.
 
-### 3b. Attach from Windows (no USB/IP client needed)
+### 3b. Attach from Windows with usbip-win (required for CAPT / host-based printers)
 
-Windows has no built-in USB/IP client, and the classic `usbip-win` client needs an
-unsigned driver (test-signing mode). The component can therefore also act as a
-plain **JetDirect-style RAW print server** on TCP 9100, which is what a Windows
-*Standard TCP/IP Port* printer speaks:
+Windows has no built-in USB/IP client: `usbipd-win` is a *server* only (it
+shares Windows USB devices outward and cannot attach to a remote USB/IP
+server). The practical Windows client is [`usbip-win`](https://github.com/cezanne/usbip-win);
+a ready-to-use copy of release **0.3.6-dev** is bundled in
+[`tools/usbip-win-0.3.6-dev/`](tools/usbip-win-0.3.6-dev/). Its vhci driver
+ships with a Microsoft attestation signature, so **no test-signing mode and no
+reboot** are needed to attach a remote device.
+
+Open an **admin** PowerShell in the tools folder and run:
+
+```powershell
+cd tools\usbip-win-0.3.6-dev
+
+# Discover exported devices on the ESP32
+.\usbip.exe list -r <esp32-ip>
+#   → e.g. "1-1: Canon, Inc. : LBP2900 (04a9:2676)"
+
+# Install the vhci driver (one-time)
+.\usbip.exe install
+
+# Attach the printer (busid from the list output, usually 1-1)
+.\usbip.exe attach -r <esp32-ip> -b 1-1
+#   → "succesfully attached to port 0"
+```
+
+The printer then appears in Device Manager as if it were plugged in locally
+(*USB Printing Support* / “USB 打印支持” under Universal Serial Bus
+controllers). Install the vendor driver as usual — the Canon CAPT driver, for
+example, binds to the virtual USB device and prints normally. This was
+verified end-to-end with a Canon LBP-2900, whose proprietary CAPT data stream
+cannot be pushed through the RAW port.
+
+Notes:
+
+- `usbip.exe` requests administrator elevation automatically (UAC prompt).
+- The attach is **not persistent**: after a reboot run `attach` again.
+- Only one USB/IP client can be attached at a time; while a client is
+  attached the RAW print server (TCP 9100) rejects new connections.
+- Detach with `.\usbip.exe detach -p *`.
+
+**Which path for which printer?**
+
+| Printer type | Examples | Recommended path |
+|--------------|----------|------------------|
+| Speaks a standard language (PCL5e/PCL6/PS) | Brother MFC-7420, most office lasers | RAW 9100 (see next section) — no client software |
+| Host-based (CAPT, UFRII-LT, GDI) | Canon LBP-2900/3000, MF3010, entry-level MFPs | usbip-win attach (this section) |
+
+### 3c. Print from Windows without a USB/IP client (RAW 9100)
 
 ```yaml
 usbip:
@@ -85,7 +135,7 @@ printer's own driver (the MFC-7420 speaks PCL5e, so any PCL laser driver works).
 The raw stream is forwarded to the printer's bulk OUT endpoint, split into
 64-byte max-packet-size chunks to work around the DWC2 bulk OUT DMA freeze.
 
-### 3c. Finding the device without Home Assistant
+### 3d. Finding the device without Home Assistant
 
 A user who has no Home Assistant still has to learn the device's IP address. The
 component offers three independent ways to do that, and none of them requires
@@ -308,3 +358,7 @@ USB transfers in ESP-IDF are asynchronous. The component uses a sequence-numbere
 | `baud_rate` error on boot | Logger using USB pins | Set `logger: baud_rate: 0`                                         |
 | Printer stuck in mass storage mode | Firmware not configured or upload failed | Add `printer_firmware: sihpP1102.dl` to config; verify file exists |
 | Linux sees device but printing fails | Wrong driver or data format | Use `foo2zjs` for HP P1102w; verify with `lpstat -t`               |
+| `usbip.exe list` fails on Windows | Elevation / firewall | Run from an **admin** PowerShell; allow the UAC prompt; check TCP 3240 |
+| Windows attach succeeds but CAPT driver can't find printer | Driver probed before attach completed | Attach first, then install the driver, or rescan in Device Manager |
+| RAW 9100 refuses connections | A USB/IP client is attached, or printer not ready | Detach with `usbip.exe detach -p *`; check web log for printer state |
+| Printer drops off USB and re-enumerates | Deep sleep of host-based printers (e.g. LBP2900) | Usually harmless; use a short shielded cable; attach again if needed |
