@@ -57,6 +57,7 @@ web_server:
   local: true
 
 usbip:
+  id: my_usbip
   # Standard USB/IP port. Do NOT add printer_firmware for the MFC-7420.
   port: 3240
   # JetDirect-style RAW print server (TCP 9100). A Windows "Standard TCP/IP
@@ -95,3 +96,13 @@ switch:
   - platform: restart
     name: "Restart Device"
     entity_category: diagnostic
+
+button:
+  # Print the info card again, for example after the address changed.
+  - platform: template
+    name: "Print Info Card"
+    icon: "mdi:printer"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          id(my_usbip).print_info_card();

@@ -200,6 +200,14 @@ class USBIPComponent : public Component {
   // find the device from any mDNS browser.
   void set_mdns_discovery(bool enabled) { this->mdns_discovery_ = enabled; }
 
+  // Print the info card again on demand (e.g. after the address changed).
+  // The card is sent as soon as the printer and the network are ready.
+  void print_info_card() {
+    this->info_card_pending_ = true;
+    this->info_card_printed_ = false;
+    this->info_card_deadline_ = millis() - 1;  // print on the next loop
+  }
+
   // USB Host callbacks
   void on_device_connected(uint8_t dev_addr);
   void on_device_disconnected(uint8_t dev_addr);

@@ -120,6 +120,23 @@ using the IP address above:
 The card is plain PCL 5e ASCII text (no code page or font dependency) and is
 printed once per boot, so re-plugging the printer does not waste a page.
 
+It can also be printed on demand with the **Print Info Card** button, which is
+useful after the address changed (for example after a DHCP reservation was
+added in the router):
+
+```yaml
+usbip:
+  id: my_usbip
+  ...
+
+button:
+  - platform: template
+    name: "Print Info Card"
+    on_press:
+      - lambda: |-
+          id(my_usbip).print_info_card();
+```
+
 **2. mDNS — `mdns_discovery: true`**
 
 The device advertises itself as `_usbip._tcp` and puts its current IP address
