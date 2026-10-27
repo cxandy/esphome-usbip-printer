@@ -62,10 +62,26 @@ cd tools\usbip-win-0.3.6-dev
 .\usbip.exe detach -p *
 ```
 
+## Even easier: one-click `attach.bat`
+
+For non-technical users there is no need to touch a terminal at all.
+Edit the `SERVER_IP` line at the top of `attach.bat` once, then:
+
+- **Double-click `attach.bat`** — it self-elevates (one UAC click), installs
+  the vhci driver if needed, auto-detects the busid, attaches the printer and
+  stays open as a **watchdog** that re-attaches automatically every 15 s
+  whenever the device drops off (host-based printers such as the LBP-2900
+  disconnect/reconnect when entering deep sleep).
+- `attach.bat autostart` — additionally registers a logon scheduled task
+  (highest privileges), so the printer is attached automatically at every
+  logon with no UAC prompt.
+- `attach.bat detach` — detach everything.
+- `attach.bat once` — attach once without the watchdog.
+
 Notes:
 
-- `usbip.exe` requests administrator elevation automatically (UAC prompt).
-- The attach is **not persistent**: after a reboot, run `attach` again.
+- The attach is **not persistent**: after a reboot, run `attach.bat` again
+  (or use the `autostart` task).
 - Only one USB/IP client can be attached to the ESP32 at a time; while a
   client is attached the RAW print server (TCP 9100) rejects new connections.
 - The remote device appears in Device Manager like a locally plugged-in USB
