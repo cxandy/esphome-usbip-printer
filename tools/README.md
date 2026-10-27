@@ -73,6 +73,11 @@ WinForms window (no extra dependencies, plain PowerShell 5.1):
 
 - editable server IP and busid (busid auto-detected if left empty; settings
   persist in `usbip-gui.ini`)
+- **自动扫描 (auto-discovery)** — finds the ESP32 automatically: first tries
+  the mDNS host names the device advertises (`usbip-server.local`,
+  `usbip-mfc7420.local`), then falls back to scanning the local /24 subnet for
+  open TCP 3240. The watchdog also re-scans automatically when several
+  attaches fail in a row (e.g. after a DHCP address change)
 - **连接并保持在线** — installs the driver if needed, attaches, and starts a
   watchdog that re-attaches automatically whenever the device drops off
   (host-based printers disconnect/reconnect on deep sleep)

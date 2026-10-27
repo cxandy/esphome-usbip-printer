@@ -70,6 +70,60 @@ function Get-Busid([string]$ip) {
     return $null
 }
 
+# ---------- device discovery ----------
+function Find-Servers {
+    $found = @()
+
+    # 1) Fast path: resolve known mDNS host names (Win10+ resolves .local natively)
+    foreach ($h in 'usbip-server.local', 'usbip-mfc7420.local') {
+        try {
+            $a = [System.Net.Dns]::GetHostAddresses($h) |
+                Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                Select-Object -First 1
+            if ($a) { $found += $a.IPAddressToString; break }
+        } catch { }
+    }
+    if ($found) { return $found | Select-Object -Unique }
+
+    # 2) Fallback: scan the local /24 for open TCP 3240 (USB/IP port)
+    try {
+        $local = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object {
+                $_.IPAddress      -notlike '127.*'     -and
+                $_.IPAddress      -notlike '169.254.*' -and
+                $_.PrefixOrigin   -ne 'WellKnown'
+            } | Sort-Object InterfaceMetric | Select-Object -First 1
+        if (-not $local) { return @() }
+        $base = ($local.IPAddress -split '\.')[0..2] -join '.'
+        Log "正在扫描网段 $base.0/24 的 3240 端口..."
+        $pending = @()
+        foreach ($i in 1..254) {
+            $ip = "$base.$i"
+            $c  = New-Object System.Net.Sockets.TcpClient
+            try {
+                $ar = $c.BeginConnect($ip, 3240, $null, $null)
+                $pending += @{ IP = $ip; Client = $c; AR = $ar }
+            } catch { $c.Close() }
+        }
+        # give the connects ~1.5 s in two passes, collect the ones that completed
+        foreach ($wait in 400, 1100) {
+            Start-Sleep -Milliseconds $wait
+            foreach ($t in $pending) {
+                if ($t.Done) { continue }
+                try {
+                    if ($t.AR.IsCompleted) {
+                        $t.Client.EndConnect($t.AR)
+                        $t.Done = $true
+                        $found += $t.IP
+                    }
+                } catch { $t.Done = $true }
+            }
+        }
+        foreach ($t in $pending) { try { $t.Client.Close() } catch { } }
+    } catch { }
+    return $found | Select-Object -Unique
+}
+
 # ---------- form ----------
 $form                = New-Object System.Windows.Forms.Form
 $form.Text           = 'USB/IP 打印客户端 (LBP2900 / ESP32)'
@@ -89,19 +143,25 @@ $form.Controls.Add($lblIp)
 $txtIp               = New-Object System.Windows.Forms.TextBox
 $txtIp.Text          = $cfg.ip
 $txtIp.Location      = New-Object System.Drawing.Point(90, 14)
-$txtIp.Size          = New-Object System.Drawing.Size(160, 24)
+$txtIp.Size          = New-Object System.Drawing.Size(150, 24)
 $form.Controls.Add($txtIp)
+
+$btnScan             = New-Object System.Windows.Forms.Button
+$btnScan.Text        = '自动扫描'
+$btnScan.Location    = New-Object System.Drawing.Point(246, 12)
+$btnScan.Size        = New-Object System.Drawing.Size(76, 26)
+$form.Controls.Add($btnScan)
 
 $lblBusid            = New-Object System.Windows.Forms.Label
 $lblBusid.Text       = '设备 busid:'
-$lblBusid.Location   = New-Object System.Drawing.Point(270, 18)
+$lblBusid.Location   = New-Object System.Drawing.Point(332, 18)
 $lblBusid.AutoSize   = $true
 $form.Controls.Add($lblBusid)
 
 $txtBusid            = New-Object System.Windows.Forms.TextBox
 $txtBusid.Text       = $cfg.busid
-$txtBusid.Location   = New-Object System.Drawing.Point(355, 14)
-$txtBusid.Size       = New-Object System.Drawing.Size(80, 24)
+$txtBusid.Location   = New-Object System.Drawing.Point(408, 14)
+$txtBusid.Size       = New-Object System.Drawing.Size(66, 24)
 $form.Controls.Add($txtBusid)
 
 $lblHint             = New-Object System.Windows.Forms.Label
@@ -141,7 +201,7 @@ $form.Controls.Add($btnRefresh)
 
 $chkAuto                  = New-Object System.Windows.Forms.CheckBox
 $chkAuto.Text             = '开机自动连接'
-$chkAuto.Location         = New-Object System.Drawing.Point(420, 84)
+$chkAuto.Location         = New-Object System.Drawing.Point(400, 50)
 $chkAuto.AutoSize         = $true
 $form.Controls.Add($chkAuto)
 
@@ -162,6 +222,19 @@ $script:lastAttachOk = $false
 $btnConnect.Add_Click({
     $cfg.ip       = $txtIp.Text.Trim()
     $cfg.busid    = $txtBusid.Text.Trim()
+
+    # IP empty or stale -> discover automatically
+    if (-not $cfg.ip) {
+        Log '未填写 IP，开始自动扫描...'
+        $found = Find-Servers
+        if (-not $found) {
+            Log '[错误] 自动扫描未发现设备。请确认打印机已插好、ESP32 已联网。'
+            return
+        }
+        foreach ($f in $found) { Log "  发现设备: $f" }
+        $cfg.ip = $found[0]
+        $txtIp.Text = $cfg.ip
+    }
     Save-Cfg
 
     $r = Run-Usbip 'install'
@@ -211,6 +284,22 @@ $btnDetach.Add_Click({
     Log '[OK] 已断开所有 USB/IP 设备。'
 })
 
+$btnScan.Add_Click({
+    $cfg.ip = $txtIp.Text.Trim()
+    Log "开始扫描 USB/IP 打印服务器..."
+    $found = Find-Servers
+    if (-not $found) {
+        Log '[失败] 未发现设备。请确认打印机已插好、ESP32 已接入同一网段。'
+        return
+    }
+    foreach ($f in $found) { Log "  发现设备: $f" }
+    if ($found.Count -gt 1) { Log '发现多台设备，已选用第一台（可在 IP 框中手动改用其他地址）。' }
+    $cfg.ip = $found[0]
+    $txtIp.Text = $cfg.ip
+    Save-Cfg
+    Log "[OK] 已选用 $cfg.ip"
+})
+
 $btnRefresh.Add_Click({
     $r = Run-Usbip 'port'
     Log "---- usbip.exe port ----"
@@ -246,16 +335,32 @@ function Run-ExternalSchTasks([string]$argline) {
 # watchdog timer
 $timer               = New-Object System.Windows.Forms.Timer
 $timer.Interval      = $cfg.interval * 1000
+$script:failCount    = 0
 $timer.Add_Tick({
     if (-not $watching) { return }
     $r = Run-Usbip "attach -r $($cfg.ip) -b $($cfg.busid)"
     if ($r.Exit -eq 0) {
+        $script:failCount = 0
         if (-not $script:lastAttachOk) {
             Log '[OK] 设备已重新连接。'
             Set-Status '● 已连接' ([System.Drawing.Color]::ForestGreen)
         }
         $script:lastAttachOk = $true
     } else {
+        $script:failCount++
+        # several failures in a row usually mean the IP changed (DHCP) -> re-scan
+        if ($script:failCount -eq 4 -and -not $script:lastAttachOk) {
+            Log '[提示] 连续失败，IP 可能已变化，重新扫描...'
+            $found = Find-Servers
+            if ($found) {
+                foreach ($f in $found) { Log "  发现设备: $f" }
+                $cfg.ip = $found[0]
+                $txtIp.Text = $cfg.ip
+                Save-Cfg
+            } else {
+                Log '[提示] 扫描未发现设备，继续重试原地址...'
+            }
+        }
         if ($script:lastAttachOk) {
             Log '[掉线] 设备丢失，持续重试中...'
             Set-Status '● 重连中...' ([System.Drawing.Color]::DarkOrange)
