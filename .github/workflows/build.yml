@@ -1,0 +1,48 @@
+name: Build ESPHome firmware
+
+on:
+  # 手动触发，可选择要编译的配置文件
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "ESPHome config to build"
+        required: false
+        default: "usbip_config.yaml"
+  # 推送时自动触发（只在这些文件变化时）
+  push:
+    paths:
+      - "usbip_config.yaml"
+      - "usbip_mfc7420.example.yaml"
+      - "components/**"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ESPHome
+        run: pip install esphome
+
+      - name: Compile firmware
+        run: esphome compile "${{ github.event.inputs.config || 'usbip_config.yaml' }}"
+
+      - name: Collect firmware binaries
+        run: |
+          mkdir -p artifacts
+          find . -path "*build/*" -name "*.bin" -exec cp {} artifacts/ \;
+          ls -la artifacts/
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
