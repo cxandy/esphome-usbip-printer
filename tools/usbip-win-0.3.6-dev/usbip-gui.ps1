@@ -66,8 +66,14 @@ function Set-Status([string]$text, [System.Drawing.Color]$color) {
 
 function Get-Busid([string]$ip) {
     $r = Run-Usbip "list -r $ip"
-    if ($r.Exit -ne 0) { return $null }
-    $line = ($r.Out -split "`n" | Where-Object { $_ -match '^\s*\d+-\d+:' } | Select-Object -First 1)
+    # dump the raw output: some usbip builds return non-zero exit codes
+    # even on success, and empty output is a diagnosis on its own
+    Log "---- usbip list $($ip) ----"
+    ($r.Out + "`n" + $r.Err) -split "`n" | ForEach-Object {
+        if ($_.Trim()) { Log $_.TrimEnd() }
+    }
+    $all = ($r.Out -split "`n") + ($r.Err -split "`n")
+    $line = $all | Where-Object { $_ -match '^\s*\d+-\d+:' } | Select-Object -First 1
     if ($line -match '^\s*(\d+-\d+):') { return $Matches[1] }
     return $null
 }
