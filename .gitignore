@@ -17,3 +17,6 @@ __pycache__/
 
 # Local secrets
 /secrets.yaml
+
+# GUI runtime settings (per machine)
+usbip-gui.ini
