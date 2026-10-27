@@ -84,6 +84,18 @@ namespace UsbIpPrintClient
             LoadCfg();
             InitUi();
             InitAutoState();
+
+            // "--auto": launched by the logon scheduled task — start the
+            // connect flow immediately (IP changes are handled by the
+            // watchdog's automatic re-scan)
+            foreach (string a in Environment.GetCommandLineArgs())
+            {
+                if (string.Equals(a, "--auto", StringComparison.OrdinalIgnoreCase))
+                {
+                    BeginInvoke((Action)(() => DoConnect()));
+                    break;
+                }
+            }
         }
 
         // ---------- config ----------
@@ -431,7 +443,7 @@ namespace UsbIpPrintClient
             {
                 string exe = Path.Combine(dir, "USBIP-Client.exe");
                 int code = RunExternal("schtasks.exe",
-                    "/create /f /tn USBIP-PrintClient /tr \"\\\"" + exe + "\\\"\" /sc onlogon /rl highest",
+                    "/create /f /tn USBIP-PrintClient /tr \"\\\"" + exe + "\\\" --auto\" /sc onlogon /rl highest",
                     out outp);
                 if (code == 0)
                 {
