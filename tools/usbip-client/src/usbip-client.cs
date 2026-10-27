@@ -158,10 +158,19 @@ namespace UsbIpPrintClient
                 psi.CreateNoWindow = true;
                 using (Process p = Process.Start(psi))
                 {
-                    string so = p.StandardOutput.ReadToEnd();
-                    string se = p.StandardError.ReadToEnd();
-                    p.WaitForExit();
-                    output = so + se;
+                    // async reads: usbip attach spawns a daemon child that may
+                    // inherit the pipes, so ReadToEnd() on the UI thread would
+                    // block forever until the child exits
+                    Task<string> so = p.StandardOutput.ReadToEndAsync();
+                    Task<string> se = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(15000))
+                    {
+                        try { p.Kill(); } catch { }
+                        output = "(timeout: usbip did not exit within 15s)";
+                        return 1;
+                    }
+                    output = so.Wait(2000) ? so.Result : "";
+                    output += se.Wait(2000) ? se.Result : "";
                     return p.ExitCode;
                 }
             }
@@ -364,6 +373,7 @@ namespace UsbIpPrintClient
                 {
                     ip = useIp; busid = useBusid; SaveCfg();
                     failCount = 0; lastAttachOk = true; watching = true;
+                    BeginInvoke((Action)(() => timer.Start()));
                     Log("[OK] 设备已连接，看门狗已启动（每 " + interval + " 秒检查一次）。");
                     Log("提示: 断线会自动重连；打印机深度睡眠掉线无需干预。");
                     SetStatusSafe("已连接", "#DCFCE7", "#166534");
@@ -373,6 +383,7 @@ namespace UsbIpPrintClient
                     Log("[连接失败] " + outp.Trim());
                     Log("看门狗将持续重试...");
                     failCount = 0; lastAttachOk = false; watching = true;
+                    BeginInvoke((Action)(() => timer.Start()));
                     SetStatusSafe("重连中...", "#FEF3C7", "#92400E");
                 }
                 SetBusySafe(false);
@@ -573,6 +584,7 @@ namespace UsbIpPrintClient
                 string outp;
                 RunUsbip("detach -p *", out outp);
                 watching = false; lastAttachOk = false;
+                timer.Stop();
                 SetStatus("未连接", "#FEE2E2", "#B91C1C");
                 Log("[OK] 已断开所有 USB/IP 设备。");
             };
