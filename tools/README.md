@@ -68,8 +68,15 @@ For non-technical users there is no need to touch a terminal at all.
 
 ### GUI (recommended)
 
-Double-click **`USBIP-Client.bat`**. It self-elevates and opens a small
-WinForms window (no extra dependencies, plain PowerShell 5.1):
+Double-click **`USBIP-Client.exe`** — a regular Windows application (C#
+WinForms, prebuilt by CI, admin manifest embedded so it shows one UAC prompt
+and opens directly, no console window). Source code lives in
+[`tools/usbip-client/src/`](usbip-client/src/) and is rebuilt automatically
+by GitHub Actions on every change.
+
+Script launchers are still available as fallbacks: `USBIP-Client.vbs`
+(PS/WPF version, no console window) and `USBIP-Client.bat` (shows a console
+briefly).
 
 - editable server IP and busid (busid auto-detected if left empty; settings
   persist in `usbip-gui.ini`)

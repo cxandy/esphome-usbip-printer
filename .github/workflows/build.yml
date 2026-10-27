@@ -14,6 +14,7 @@ on:
       - "usbip_config.yaml"
       - "usbip_mfc7420.example.yaml"
       - "components/**"
+      - "tools/usbip-client/**"
       - ".github/workflows/build.yml"
 
 jobs:
@@ -46,3 +47,37 @@ jobs:
           name: firmware-${{ github.run_number }}
           path: artifacts/
           if-no-files-found: error
+
+  # Build the Windows GUI client exe and commit it back to the repo,
+  # so end users can download it directly without any build step.
+  build-client:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile USBIP-Client.exe
+        shell: pwsh
+        run: |
+          & "$env:windir\Microsoft.NET\Framework64\v4.0.30319\csc.exe" `
+            /nologo /target:winexe /platform:anycpu /langversion:5 `
+            /win32manifest:tools/usbip-client/src/app.manifest `
+            /codepage:65001 `
+            /out:tools/usbip-win-0.3.6-dev/USBIP-Client.exe `
+            tools/usbip-client/src/usbip-client.cs
+          Get-Item tools/usbip-win-0.3.6-dev/USBIP-Client.exe | Format-List Name, Length
+
+      - name: Commit exe back to the repo
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/usbip-win-0.3.6-dev/USBIP-Client.exe
+          if (git diff --cached --quiet) {
+            Write-Host "No change in the exe, skipping commit"
+          } else {
+            git commit -m "ci: rebuild USBIP-Client.exe [skip ci]"
+            git push
+          }

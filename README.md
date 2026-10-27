@@ -106,10 +106,12 @@ verified end-to-end with a Canon LBP-2900, whose proprietary CAPT data stream
 cannot be pushed through the RAW port.
 
 **One-click / GUI variant:** don't want to touch a terminal? In
-[`tools/usbip-win-0.3.6-dev/`](tools/usbip-win-0.3.6-dev/) either double-click
-**`USBIP-Client.bat`** for a small GUI (connect/disconnect, auto-reconnect
-watchdog, logon autostart), or edit the `SERVER_IP` line in
-**`attach.bat`** and double-click it for a console one-click attach. See
+[`tools/usbip-win-0.3.6-dev/`](tools/usbip-win-0.3.6-dev/) double-click
+**`USBIP-Client.exe`** — a regular Windows GUI app (auto-discovery,
+connect/disconnect, auto-reconnect watchdog, logon autostart; built by CI
+from [`tools/usbip-client/src/`](tools/usbip-client/src/usbip-client.cs)).
+Script fallbacks: `USBIP-Client.vbs` / `USBIP-Client.bat` (GUI) or edit the
+`SERVER_IP` line in **`attach.bat`** for a console one-click attach. See
 [`tools/README.md`](tools/README.md) for details.
 
 Notes:

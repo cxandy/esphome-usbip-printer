@@ -2,7 +2,8 @@
 #  USB/IP Print Client GUI  (WPF, PowerShell 5.1, zero deps)
 #  Bundled client: usbip-win 0.3.6-dev (usbip.exe in this folder)
 #
-#  Launch with the elevated launcher "USBIP-Client.bat".
+#  Launch with "USBIP-Client.vbs" (no console window).
+#  "USBIP-Client.bat" still works but shows a console briefly.
 #  Settings persist in usbip-gui.ini next to this file.
 # ============================================================
 
@@ -14,7 +15,7 @@ Add-Type -AssemblyName WindowsBase
 $script:dir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:usbip = Join-Path $script:dir 'usbip.exe'
 $script:ini   = Join-Path $script:dir 'usbip-gui.ini'
-$script:bat   = Join-Path $script:dir 'USBIP-Client.bat'
+$script:vbs   = Join-Path $script:dir 'USBIP-Client.vbs'
 
 # ---------- config load ----------
 $cfg = @{ ip = ''; busid = ''; interval = 15 }
@@ -407,7 +408,7 @@ $btnDetach.Add_Click({
 $chkAuto.Add_Click({
     $task = 'USBIP-PrintClient'
     if ($chkAuto.IsChecked) {
-        $arg = "/create /f /tn $task /tr `"$bat`" /sc onlogon /rl highest"
+        $arg = "/create /f /tn $task /tr \"wscript.exe \`"$vbs\`"\" /sc onlogon /rl highest"
         if (Run-ExternalSchTasks $arg) {
             Log '[OK] 已注册开机自动连接（登录时自动运行，无需 UAC）。'
         } else {
