@@ -62,9 +62,26 @@ cd tools\usbip-win-0.3.6-dev
 .\usbip.exe detach -p *
 ```
 
-## Even easier: one-click `attach.bat`
+## Even easier: one-click `attach.bat` or the GUI
 
 For non-technical users there is no need to touch a terminal at all.
+
+### GUI (recommended)
+
+Double-click **`USBIP-Client.bat`**. It self-elevates and opens a small
+WinForms window (no extra dependencies, plain PowerShell 5.1):
+
+- editable server IP and busid (busid auto-detected if left empty; settings
+  persist in `usbip-gui.ini`)
+- **连接并保持在线** — installs the driver if needed, attaches, and starts a
+  watchdog that re-attaches automatically whenever the device drops off
+  (host-based printers disconnect/reconnect on deep sleep)
+- **断开**, **查看端口状态**
+- **开机自动连接** checkbox — registers/removes a logon scheduled task
+  (`USBIP-PrintClient`, highest privileges, no UAC at logon)
+
+### `attach.bat` (console variant)
+
 Edit the `SERVER_IP` line at the top of `attach.bat` once, then:
 
 - **Double-click `attach.bat`** — it self-elevates (one UAC click), installs

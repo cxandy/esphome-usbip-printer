@@ -105,13 +105,11 @@ example, binds to the virtual USB device and prints normally. This was
 verified end-to-end with a Canon LBP-2900, whose proprietary CAPT data stream
 cannot be pushed through the RAW port.
 
-**One-click variant:** don't want to touch a terminal? Edit the `SERVER_IP`
-line in [`tools/usbip-win-0.3.6-dev/attach.bat`](tools/usbip-win-0.3.6-dev/attach.bat)
-and simply double-click it. The script self-elevates, installs the driver if
-needed, auto-detects the busid, attaches the printer, and runs a watchdog
-that re-attaches automatically whenever the device drops off (host-based
-printers disconnect/reconnect on deep sleep). `attach.bat autostart` makes it
-run automatically at every logon. See
+**One-click / GUI variant:** don't want to touch a terminal? In
+[`tools/usbip-win-0.3.6-dev/`](tools/usbip-win-0.3.6-dev/) either double-click
+**`USBIP-Client.bat`** for a small GUI (connect/disconnect, auto-reconnect
+watchdog, logon autostart), or edit the `SERVER_IP` line in
+**`attach.bat`** and double-click it for a console one-click attach. See
 [`tools/README.md`](tools/README.md) for details.
 
 Notes:
