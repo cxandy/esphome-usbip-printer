@@ -24,13 +24,14 @@ Implemented with help of AI. This is a POC. Verified with:
 - USB device hot-plug detection (connect and disconnect at runtime)
 - Automatic HP Smart Install firmware upload for HP LaserJet P1102w printer
 - Workaround for ESP32-S3 DWC2 bulk OUT DMA silicon bug
+- ESP32-P4 support, including high-speed (480 Mbit/s) USB devices on its high-speed USB port
 - JetDirect-style RAW print server (TCP 9100) so Windows/macOS/Linux can print without any USB/IP client (printers speaking a standard language such as PCL/PS only — CAPT/host-based printers need the USB/IP client)
 - mDNS discovery (`_usbip._tcp`) that carries the current IP address in the TXT record
 - Info card: the device prints its own IP address on the attached printer, so even a user without Home Assistant can find it
 
 ## Prerequisites
 
-- **Hardware:** [Waveshare ESP32-S3-ETH](https://www.waveshare.com/wiki/ESP32-S3-ETH) (or any ESP32-S3 board with Ethernet and exposed USB host pins)
+- **Hardware:** [Waveshare ESP32-S3-ETH](https://www.waveshare.com/wiki/ESP32-S3-ETH) (or any ESP32-S3 board with Ethernet and exposed USB host pins), or an ESP32-P4 board with Ethernet and a USB host port (for example the M5Stack Unit PoE-P4)
 - **Framework:** [ESPHome](https://esphome.io/) 2025.12+ with ESP-IDF backend
 - **Linux client:** `usbip` utilities (package `linux-tools-common` on Ubuntu/Debian)
 - **Windows client:** [usbip-win](https://github.com/cezanne/usbip-win) — a copy is bundled in [`tools/usbip-win-0.3.6-dev/`](tools/usbip-win-0.3.6-dev/)
@@ -279,7 +280,9 @@ logger:
   baud_rate: 0
 ```
 
-**Mandatory.** The ESP32-S3 USB pins (GPIO19/20) are shared between JTAG/serial and USB Host mode. `baud_rate: 0` releases them for USB Host. Log output is available via the ESPHome web server or Home Assistant API instead.
+**Mandatory on the ESP32-S3.** The ESP32-S3 USB pins (GPIO19/20) are shared between JTAG/serial and USB Host mode. `baud_rate: 0` releases them for USB Host. Log output is available via the ESPHome web server or Home Assistant API instead.
+
+**Not needed on the ESP32-P4.** The component uses the P4's high-speed USB controller, which has its own dedicated pins, so the default logger can stay on.
 
 ### Full example
 
@@ -303,13 +306,15 @@ The component implements USB/IP protocol version 0x0111 over a single TCP connec
 
 The ESP32-S3 uses a Synopsys DWC2 USB controller in Scatter-Gather DMA mode. This mode has a silicon bug: **bulk OUT transfers requiring multiple DMA descriptors freeze the controller**. Any OUT transfer larger than one max-packet-size (64 bytes for Full-Speed) triggers the freeze.
 
-**Workaround:** Bulk OUT data is split into individual 64-byte MPS chunks, each submitted as a separate transfer via the ESP-IDF API. Single-descriptor transfers avoid the bug. ESP-IDF handles DATA0/DATA1 toggle tracking internally.
+**Workaround:** Bulk OUT data is split into chunks of one max-packet-size each (the endpoint's `wMaxPacketSize`: 64 bytes at Full-Speed, 512 at High-Speed), each submitted as a separate transfer via the ESP-IDF API. Single-descriptor transfers avoid the bug. ESP-IDF handles DATA0/DATA1 toggle tracking internally.
 
-A direct Buffer DMA mode fallback (`USE_DIRECT_BULK_OUT=1`) that bypasses ESP-IDF is included in the source but disabled by default.
+A direct Buffer DMA mode fallback (`USE_DIRECT_BULK_OUT=1`) that bypasses ESP-IDF is included in the source but disabled by default. It only supports Full-Speed (64-byte packets).
+
+The same chunking is used on the ESP32-P4. It is not yet known whether the P4 needs it.
 
 ### Bulk IN Alignment
 
-ESP-IDF rejects bulk IN transfers whose size is not a multiple of the endpoint max packet size (`ESP_ERR_INVALID_ARG`). The component rounds up all IN buffer allocations to the next 64-byte boundary.
+ESP-IDF rejects bulk IN transfers whose size is not a multiple of the endpoint max packet size (`ESP_ERR_INVALID_ARG`). The component rounds up all IN buffer allocations to the next multiple of the endpoint's max packet size (64 bytes at Full-Speed, 512 at High-Speed).
 
 ### Device Hot-Plug
 
@@ -323,7 +328,7 @@ The HP LaserJet P1102w powers up as a USB Mass Storage device ("Smart Install").
 
 1. **Detect** — mass storage interface (class 0x08) on an HP VID triggers the flow
 2. **Mode switch** — SCSI vendor command 0xD0 sent via CBW; device disconnects and re-enumerates
-3. **Upload** — firmware sent in 64-byte chunks; progress logged every 10%
+3. **Upload** — firmware sent in max-packet-size chunks; progress logged every 10%
 4. **Ready** — device re-enumerates with firmware loaded (`FWVER:` appears in Device ID)
 
 The firmware is volatile (lost on every power cycle), so the upload repeats on every replug.
@@ -351,7 +356,7 @@ USB transfers in ESP-IDF are asynchronous. The component uses a sequence-numbere
 - Only one USB device is supported at a time (single-port USB host)
 - Only one USB/IP client can be connected at a time
 - Isochronous and interrupt transfers are not implemented (bulk and control only)
-- Full-Speed devices only (12 Mbit/s) — the ESP32-S3 USB host does not support High-Speed
+- Full-Speed devices only (12 Mbit/s) on the ESP32-S2/S3, whose USB host does not support High-Speed. The ESP32-P4's high-speed port also runs High-Speed (480 Mbit/s) devices.
 - PSRAM must be disabled due to DMA constraints
 - The ESP-IDF 5.5 mDNS responder can stop answering *multicast* queries a while
   after boot (the service record itself stays intact and still answers unicast

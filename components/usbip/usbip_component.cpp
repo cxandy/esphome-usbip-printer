@@ -34,6 +34,15 @@
 #include "hal/usb_dwc_ll.h"
 #include "soc/usb_dwc_struct.h"
 
+// The DWC2 core driven by the ESP-IDF USB Host Library. usb_host_install() below passes
+// peripheral_map = 0, which selects peripheral 0: the only core on ESP32-S2/S3 and the
+// high-speed core on ESP32-P4. Older ESP-IDF releases without the macro only have USB_DWC.
+#ifdef USB_DWC_LL_GET_HW
+#define USBIP_DWC_HW USB_DWC_LL_GET_HW(0)
+#else
+#define USBIP_DWC_HW (&USB_DWC)
+#endif
+
 namespace esphome {
 namespace usbip {
 
@@ -56,7 +65,10 @@ namespace usbip {
 #define USE_DIRECT_BULK_OUT 0  // Try standard ESP-IDF API - others report success with printers
 
 #define DIRECT_CHANNEL 7  // Use channel 7 (highest) to avoid conflict with ESP-IDF channels
-#define BULK_MPS 64       // Full-Speed bulk max packet size
+// Full-speed bulk max packet size. Used by the ESP32-S3 direct DMA path below and as a
+// fallback when an endpoint's size is unknown. Everything else uses the endpoint's own
+// wMaxPacketSize (see bulk_mps_()), which is 512 for high-speed devices on the ESP32-P4.
+#define FS_BULK_MPS 64
 #define USB_PID_DATA0 0
 #define USB_PID_DATA1 2
 #define DMA_BUFFER_SIZE 1024
@@ -92,7 +104,7 @@ static void direct_usb_init() {
 
   ESP_LOGD(TAG_DIRECT, "Initializing direct USB DMA access");
 
-  usb_dwc_dev_t *hw = &USB_DWC;
+  usb_dwc_dev_t *hw = USBIP_DWC_HW;
   uint32_t snpsid = hw->gsnpsid_reg.val;
   ESP_LOGD(TAG_DIRECT, "USB DWC Core ID: 0x%08lX", (unsigned long)snpsid);
 
@@ -145,7 +157,7 @@ static DirectUSBResult direct_bulk_out(uint8_t dev_addr, uint8_t ep_num,
     return DirectUSBResult::ERROR_ALLOC;
   }
 
-  usb_dwc_dev_t *hw = &USB_DWC;
+  usb_dwc_dev_t *hw = USBIP_DWC_HW;
   volatile usb_dwc_host_chan_regs_t *chan = &hw->host_chans[DIRECT_CHANNEL];
 
   *actual_sent = 0;
@@ -201,8 +213,8 @@ static DirectUSBResult direct_bulk_out(uint8_t dev_addr, uint8_t ep_num,
 
   while (bytes_sent < length) {
     uint32_t packet_size = length - bytes_sent;
-    if (packet_size > BULK_MPS) {
-      packet_size = BULK_MPS;
+    if (packet_size > FS_BULK_MPS) {
+      packet_size = FS_BULK_MPS;
     }
 
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -219,7 +231,7 @@ static DirectUSBResult direct_bulk_out(uint8_t dev_addr, uint8_t ep_num,
     // Configure HCCHAR for BULK OUT
     usb_dwc_hcchar_reg_t hcchar;
     hcchar.val = 0;
-    hcchar.mps = BULK_MPS;
+    hcchar.mps = FS_BULK_MPS;
     hcchar.epnum = ep_num;
     hcchar.epdir = 0;  // OUT
     hcchar.lspddev = 0;
@@ -613,7 +625,7 @@ static void usb_transfer_callback(usb_transfer_t *transfer) {
 // Debug function to dump USB DWC2 hardware state
 static void dump_usb_hw_state(const char *context) {
   // Access the USB DWC2 registers directly
-  usb_dwc_dev_t *usb_dwc = &USB_DWC;
+  usb_dwc_dev_t *usb_dwc = USBIP_DWC_HW;
 
   // Read key registers
   uint32_t gintsts = usb_dwc->gintsts_reg.val;
@@ -967,14 +979,29 @@ void USBIPComponent::handle_raw_client_() {
   }
 }
 
+uint16_t USBIPComponent::bulk_mps_(uint8_t ep_addr) const {
+  for (uint8_t i = 0; i < this->usb_device_.num_endpoints && i < USBIP_MAX_ENDPOINTS; i++) {
+    const EndpointInfo &ep = this->usb_device_.endpoints[i];
+    if (ep.address == ep_addr) {
+      // Bits 10..0 of wMaxPacketSize hold the packet size (64 at full speed, 512 at high speed)
+      uint16_t mps = ep.max_packet_size & 0x07FF;
+      if (mps != 0) {
+        return mps;
+      }
+    }
+  }
+  return FS_BULK_MPS;
+}
+
 bool USBIPComponent::send_printer_bulk_out_(const uint8_t *data, size_t length) {
   if (!usb_device_hdl || this->usb_device_.printer_bulk_out_ep == 0) {
     ESP_LOGE(TAG, "Printer bulk OUT endpoint not available");
     return false;
   }
 
+  const uint16_t mps = this->bulk_mps_(this->usb_device_.printer_bulk_out_ep);
   usb_transfer_t *transfer = nullptr;
-  esp_err_t err = usb_host_transfer_alloc(BULK_MPS, 0, &transfer);
+  esp_err_t err = usb_host_transfer_alloc(mps, 0, &transfer);
   if (err != ESP_OK || !transfer) {
     ESP_LOGE(TAG, "Failed to allocate bulk transfer: %s", esp_err_to_name(err));
     return false;
@@ -989,8 +1016,8 @@ bool USBIPComponent::send_printer_bulk_out_(const uint8_t *data, size_t length) 
   bool ok = true;
   while (offset < length) {
     size_t chunk = length - offset;
-    if (chunk > BULK_MPS) {
-      chunk = BULK_MPS;
+    if (chunk > mps) {
+      chunk = mps;
     }
 
     memcpy(transfer->data_buffer, data + offset, chunk);
@@ -1684,12 +1711,14 @@ bool USBIPComponent::enumerate_device_(uint8_t dev_addr) {
   usb_device_info_t dev_info;
   err = usb_host_device_info(usb_device_hdl, &dev_info);
   if (err == ESP_OK) {
-    // ESP-IDF uses: USB_SPEED_LOW=0, USB_SPEED_FULL=1
+    // ESP-IDF uses: USB_SPEED_LOW=0, USB_SPEED_FULL=1, USB_SPEED_HIGH=2 (ESP32-P4 only)
     // Linux USB/IP uses: USB_SPEED_LOW=1, USB_SPEED_FULL=2, USB_SPEED_HIGH=3
     if (dev_info.speed == 0) {  // ESP-IDF USB_SPEED_LOW
       this->usb_device_.speed = USBIP_SPEED_LOW;
-    } else {  // ESP-IDF USB_SPEED_FULL or higher
+    } else if (dev_info.speed == 1) {  // ESP-IDF USB_SPEED_FULL
       this->usb_device_.speed = USBIP_SPEED_FULL;
+    } else {  // ESP-IDF USB_SPEED_HIGH
+      this->usb_device_.speed = USBIP_SPEED_HIGH;
     }
     ESP_LOGD(TAG, "Device speed: ESP-IDF=%d -> USBIP=%lu",
              dev_info.speed, (unsigned long)this->usb_device_.speed);
@@ -1825,9 +1854,12 @@ bool USBIPComponent::handle_hp_smart_install_() {
   }
   ESP_LOGD(TAG, "Mass storage endpoints: OUT=0x%02X IN=0x%02X", bulk_out_ep, bulk_in_ep);
 
-  // Allocate transfer buffer (64 bytes, enough for CBW=31 and CSW=13)
+  // Allocate one max-packet transfer buffer (enough for CBW=31 and CSW=13)
+  const uint16_t in_mps = this->bulk_mps_(bulk_in_ep);
+  const uint16_t out_mps = this->bulk_mps_(bulk_out_ep);
+  const size_t buf_size = in_mps > out_mps ? in_mps : out_mps;
   usb_transfer_t *transfer = nullptr;
-  esp_err_t err = usb_host_transfer_alloc(BULK_MPS, 0, &transfer);
+  esp_err_t err = usb_host_transfer_alloc(buf_size, 0, &transfer);
   if (err != ESP_OK || !transfer) {
     ESP_LOGE(TAG, "Failed to allocate transfer: %s", esp_err_to_name(err));
     return false;
@@ -1839,7 +1871,7 @@ bool USBIPComponent::handle_hp_smart_install_() {
 
   // Build USB Mass Storage CBW (Command Block Wrapper) - 31 bytes
   // SCSI vendor command 0xD0 triggers mode switch from Smart Install to printer
-  memset(transfer->data_buffer, 0, BULK_MPS);
+  memset(transfer->data_buffer, 0, buf_size);
   transfer->data_buffer[0] = 0x55;  // dCBWSignature "USBC"
   transfer->data_buffer[1] = 0x53;
   transfer->data_buffer[2] = 0x42;
@@ -1884,8 +1916,8 @@ bool USBIPComponent::handle_hp_smart_install_() {
 
   // Try to read CSW (Command Status Wrapper) - 13 bytes
   // The device may disconnect before responding, which is acceptable
-  memset(transfer->data_buffer, 0, BULK_MPS);
-  transfer->num_bytes = BULK_MPS;  // Must be multiple of MPS for bulk IN
+  memset(transfer->data_buffer, 0, buf_size);
+  transfer->num_bytes = in_mps;  // Must be multiple of MPS for bulk IN
   transfer->bEndpointAddress = bulk_in_ep;
 
   prepare_transfer(transfer);
@@ -1935,8 +1967,9 @@ bool USBIPComponent::upload_hp_firmware_() {
   ESP_LOGD(TAG, "Using bulk OUT endpoint 0x%02X", bulk_out_ep);
 
   // Allocate single MPS-sized transfer for chunked sending
+  const uint16_t mps = this->bulk_mps_(bulk_out_ep);
   usb_transfer_t *transfer = nullptr;
-  esp_err_t err = usb_host_transfer_alloc(BULK_MPS, 0, &transfer);
+  esp_err_t err = usb_host_transfer_alloc(mps, 0, &transfer);
   if (err != ESP_OK || !transfer) {
     ESP_LOGE(TAG, "Failed to allocate transfer: %s", esp_err_to_name(err));
     this->fw_state_ = FW_STATE_IDLE;
@@ -1955,8 +1988,8 @@ bool USBIPComponent::upload_hp_firmware_() {
 
   while (offset < printer_fw_data_size) {
     size_t chunk = printer_fw_data_size - offset;
-    if (chunk > BULK_MPS) {
-      chunk = BULK_MPS;
+    if (chunk > mps) {
+      chunk = mps;
     }
 
     memcpy(transfer->data_buffer, printer_fw_data + offset, chunk);
@@ -2773,12 +2806,13 @@ bool USBIPComponent::handle_bulk_transfer_(uint32_t seqnum, uint32_t ep, uint32_
                (unsigned long)rate, (unsigned long)elapsed_s);
     }
 #else
-    // Bulk OUT - chunked to BULK_MPS to avoid SG-DMA freeze on ESP32-S3.
+    // Bulk OUT - chunked to the endpoint's max packet size to avoid SG-DMA freeze on ESP32-S3.
     // Large transfers require multiple scatter-gather DMA descriptors which hang
     // the DWC2 controller. Sending max-packet-size chunks uses single DMA
     // descriptors, and ESP-IDF HAL handles DATA toggle properly.
+    const uint16_t mps = this->bulk_mps_(ep_addr);
     usb_transfer_t *transfer;
-    esp_err_t err = usb_host_transfer_alloc(BULK_MPS, 0, &transfer);
+    esp_err_t err = usb_host_transfer_alloc(mps, 0, &transfer);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Bulk OUT alloc failed: %s", esp_err_to_name(err));
       this->send_urb_response_(seqnum, -12, nullptr, 0);  // -ENOMEM
@@ -2803,12 +2837,12 @@ bool USBIPComponent::handle_bulk_transfer_(uint32_t seqnum, uint32_t ep, uint32_
     uint32_t total_sent = 0;
     bool chunk_failed = false;
 
-    ESP_LOGD(TAG, "Bulk OUT: %lu bytes to ep 0x%02X (chunked %d-byte)",
-             (unsigned long)length, ep_addr, BULK_MPS);
+    ESP_LOGD(TAG, "Bulk OUT: %lu bytes to ep 0x%02X (chunked %u-byte)",
+             (unsigned long)length, ep_addr, (unsigned) mps);
 
     while (total_sent < length && !chunk_failed) {
       uint32_t chunk = length - total_sent;
-      if (chunk > BULK_MPS) chunk = BULK_MPS;
+      if (chunk > mps) chunk = mps;
 
       memcpy(transfer->data_buffer, data + total_sent, chunk);
       transfer->num_bytes = chunk;
@@ -2879,9 +2913,10 @@ bool USBIPComponent::handle_bulk_transfer_(uint32_t seqnum, uint32_t ep, uint32_
     }
 
     // ESP-IDF requires IN transfer size to be a multiple of MPS
+    const uint16_t mps = this->bulk_mps_(ep_addr);
     usb_transfer_t *transfer;
-    size_t req_size = length > 0 ? length : BULK_MPS;
-    size_t alloc_size = ((req_size + BULK_MPS - 1) / BULK_MPS) * BULK_MPS;
+    size_t req_size = length > 0 ? length : mps;
+    size_t alloc_size = ((req_size + mps - 1) / mps) * mps;
     esp_err_t err = usb_host_transfer_alloc(alloc_size, 0, &transfer);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to allocate transfer: %s", esp_err_to_name(err));

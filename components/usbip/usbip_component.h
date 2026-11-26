@@ -238,6 +238,7 @@ class USBIPComponent : public Component {
   void start_raw_print_server_();
   void handle_raw_client_();
   bool send_printer_bulk_out_(const uint8_t *data, size_t length);
+  uint16_t bulk_mps_(uint8_t ep_addr) const;  // endpoint wMaxPacketSize, 64 if unknown
   void find_printer_endpoints_();
 
   // Info card printing
